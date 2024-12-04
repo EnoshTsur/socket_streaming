@@ -1,63 +1,78 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
-from pyspark.sql.functions import from_json, col
+from pyspark.sql.functions import *
+from app.settings.config import HDFS_URL
+from app.spark.schema import schema
+from app.spark.client import spark_client
 
 
-HDFS_URL = 'hdfs://192.168.1.2:8020'
-
-spark_client: SparkSession = (
-    SparkSession
-        .builder
-        .appName("socket_app")
-        .master("local[3]")
-        .config("spark.hadoop.fs.defaultFS", HDFS_URL)
-        .config("spark.sql.legacy.timeParserPolicy","LEGACY")
-        .config("spark.hadoop.fs.hdfs.impl", "org.apache.hadoop.hdfs.DistributedFileSystem") 
-        .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem")
-        .getOrCreate()
+streamingDF = (
+    spark_client.readStream
+    .format("socket")
+    .option("host", "localhost")
+    .option("port", 9999)
+    .load()
 )
 
-# data_schema = StructType(fields=[
-#     StructField("name", StringType()),
-#     StructField("email", StringType()),
-#     StructField("age", IntegerType()),
-#     StructField("city", StringType()),
-#     StructField("job", StringType())
-# ])
+# Parse JSON
+parsed_df = (
+    streamingDF
+    .select(from_json(col("value"), ArrayType(schema)).alias("data"))
+    .select(explode("data").alias("record"))
+    .select("record.*")
+    .groupBy("Disease Category")
+    .agg(
+        count("*").alias("total_cases"),
+        avg("Prevalence Rate (%)").alias("avg_prevalence"),
+        max("Mortality Rate (%)").alias("max_mortality")
+    )
+)
 
-# streamingDF = (
-#     spark_client.readStream
-#     .format("socket")
-#     .option("host", "localhost")
-#     .option("port", 9999)
-#     .load()
-# )
+checkpoint_path = f"{HDFS_URL}/checkpoints/health_stats"
+output_path = f"{HDFS_URL}/health_stats"
 
-# parsed_df = (
-#     streamingDF
-#         .select(from_json(col("value"), schema=data_schema).alias("user"))
-#         .select("user.*")
-# )
+def write_batch(batch_df, batch_id):
+    """
+    Write a batch to HDFS with error handling and logging
+    """
+    try:
+        if not batch_df.isEmpty():
+            # Log the batch information
+            print(f"Processing batch {batch_id} with {batch_df.count()} records")
+            
+            # Write to HDFS
+            (batch_df
+             .coalesce(1)  # Optimize small writes
+             .write
+             .mode("append")
+             .parquet(f"{HDFS_URL}/health_stats"))
+            
+            print(f"Successfully wrote batch {batch_id} to HDFS")
+            
+            # Optionally verify the write
+            count = spark_client.read.parquet(f"{HDFS_URL}/health_stats").count()
+            print(f"Total records in HDFS after batch: {count}")
+            
+    except Exception as e:
+        print(f"Error writing batch {batch_id}: {str(e)}")
+        raise  # Re-raise the exception to let Spark handle it
+
+query = (
+    parsed_df.writeStream
+    .foreachBatch(write_batch)
+    .outputMode("update")
+    .option("checkpointLocation", f"{HDFS_URL}/checkpoints/health_stats")
+    .start()
+)
 
 # query = (
 #     parsed_df.writeStream
-#         .outputMode("append")
+#         .outputMode("update")
 #         .format("console")
 #         .option("truncate", False)
 #         .start()
 # )
 
-# query = (
-#     parsed_df.writeStream
-#         .outputMode("append")
-#         .format("parquet")
-#         .option("path", f"{HDFS_URL}/users")
-#         .option("checkpointLocation", f"{HDFS_URL}/checkpoints")
-#         .partitionBy("city")
-#         .trigger(processingTime="1 minute")
-#         .start()
-# )
 
-# query.awaitTermination()
+query.awaitTermination()
 
-spark_client.read.parquet(f"{HDFS_URL}/users").show()
+# spark_client.read.parquet(f"{HDFS_URL}/users").show()
